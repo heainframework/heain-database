@@ -26,6 +26,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
+	_ "github.com/mattn/go-sqlite3"    // registers the "sqlite3" database/sql driver (-external-dialect sqlite); previously only ever imported from test files, so the real binary could not actually start with this dialect until now
 
 	"github.com/heainframework/heain-database/internal/accountstore"
 	"github.com/heainframework/heain-database/internal/audit"
