@@ -1,0 +1,25 @@
+# heain-database under the heain conformance suite (heain-sdk conformance/).
+# The suite runs the app as a plain process; here its outside store is SQLite
+# (in the app's state directory), so no database server is needed. The live
+# test scripts/live_4b.sh runs it against PostgreSQL.
+manifest: heain-app.yaml
+build: [go, build, -o, heain-database, ./cmd/heain-database]
+start: [./heain-database, -external-dialect, sqlite]
+port: 19460
+endpoints:
+  - {method: PUT, path: /v1/accounts/conf-acct-1, body: {role: tester, metadata_kv: {note: conformance-secret-account}}, expect: 200, secret: conformance-secret-account}
+  - {method: GET, path: /v1/accounts/conf-acct-1, expect: 200}
+  - {method: GET, path: /v1/accounts, expect: 200}
+  - {method: PUT, path: /v1/knowledge/conf/k1, body: {value: conformance-secret-knowledge}, expect: 200, secret: conformance-secret-knowledge}
+  - {method: GET, path: /v1/knowledge/conf/k1, expect: 200}
+  - method: POST
+    path: /v1/datasets/conf-voters/import
+    body: {scope_key: d1, source_description: conformance, records: [{record_key: rk-1, value: {name: conformance-secret-reference}}]}
+    expect: 200
+    secret: conformance-secret-reference
+  - {method: GET, path: "/v1/datasets/conf-voters?scope_key=d1", expect: 200}
+  - {method: GET, path: "/v1/datasets/conf-voters/records/rk-1?scope_key=d1", expect: 200}
+p5:
+  propose: {method: PUT, path: /v1/policy/conf/threshold, body: {value: "0.9"}}
+  status: {method: GET, path: "/v1/requests/{action_id}"}
+  type: db.policy_write

@@ -1,0 +1,41 @@
+# heain-database v2 (Step 4b-2, 2026-10-06): the storage base app on heain-sdk v1.
+# "inside": accounts and AI/ML knowledge (BoltDB); "outside": imported reference
+# datasets (SQL). All of it node-local and sealed under data keys held by core's KMS.
+manifest_version: 1
+app:
+  id: heain-database
+  version: 2.0.0
+  group: base
+  description: Universal storage base app -- inside data (accounts, knowledge) and outside reference datasets.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - {name: db.account.read, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [account]}
+  - {name: db.account.write, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [account]}
+  - {name: db.knowledge.read, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [knowledge]}
+  - {name: db.knowledge.write, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [knowledge]}
+  - {name: db.policy.propose, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [knowledge]}
+  - {name: db.request.status, version: 1, formal: false, execution: direct, ai: {used: false}}
+  - {name: db.dataset.import, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [reference]}
+  - {name: db.dataset.lookup, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [reference]}
+  - {name: db.dataset.purge, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [reference]}
+endpoints:
+  - {method: PUT, path: "/v1/accounts/{id}", capability: db.account.write, formal: true}
+  - {method: DELETE, path: "/v1/accounts/{id}", capability: db.account.write, formal: true}
+  - {method: GET, path: "/v1/accounts/{id}", capability: db.account.read, formal: true}
+  - {method: GET, path: /v1/accounts, capability: db.account.read, formal: true}
+  - {method: PUT, path: "/v1/knowledge/{ns}/{key}", capability: db.knowledge.write, formal: true}
+  - {method: GET, path: "/v1/knowledge/{ns}/{key}", capability: db.knowledge.read, formal: true}
+  - {method: PUT, path: "/v1/policy/{ns}/{key}", capability: db.policy.propose, formal: true}
+  - {method: GET, path: "/v1/requests/{action_id}", capability: db.request.status, formal: false}
+  - {method: POST, path: "/v1/datasets/{name}/import", capability: db.dataset.import, formal: true}
+  - {method: GET, path: "/v1/datasets/{name}", capability: db.dataset.lookup, formal: true}
+  - {method: GET, path: "/v1/datasets/{name}/records/{key}", capability: db.dataset.lookup, formal: true}
+  - {method: POST, path: "/v1/datasets/{name}/purge", capability: db.dataset.purge, formal: true}
+data_classes:
+  - {name: account, sovereignty: node-local, encrypted_at_rest: true, crypto_shred: true}
+  - {name: knowledge, sovereignty: node-local, encrypted_at_rest: true, crypto_shred: true}
+  - {name: reference, sovereignty: node-local, encrypted_at_rest: true, crypto_shred: true}
+offline:
+  allowed: [db.account.read, db.account.write, db.knowledge.read, db.knowledge.write, db.dataset.import, db.dataset.lookup, db.request.status]
+  journal: none

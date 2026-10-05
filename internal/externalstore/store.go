@@ -1,59 +1,52 @@
 // Package externalstore holds heain-database's "outside" domain: bulk
-// reference data brought in from outside the system for verification/
-// cross-checking by other modules at runtime (the author's own example:
-// a population/voter-eligibility registry, queried to confirm a person's
-// eligibility before allowing them to register). The system does not
-// generate or own this data -- it only consults it.
+// reference data brought in from outside the system for verification by
+// other apps at runtime (the author's example: a voter-eligibility registry,
+// queried to confirm a person may register). The system does not own this
+// data; it only consults it.
 //
-// Storage: a real RDBMS, accessed through database/sql so the engine is a
-// deployment choice, not a compile-time one. The default production engine
-// is PostgreSQL (via a pgx-family driver, wired by cmd/node); this package
-// itself imports no driver and speaks only database/sql + ANSI-portable
-// SQL, so a deployment can redirect to SQLite or another engine with no
-// schema-design cost -- confirmed explicitly for heain-database's "outside"
-// domain (see design-notes/n-tier-generalization.md).
+// Storage: a real RDBMS through database/sql -- PostgreSQL by default,
+// SQLite or another engine by deployment choice (decision 1). Data enters
+// only by bulk import, one versioned snapshot per (dataset, scope_key)
+// (decisions 2 and 5); its end-of-life action is set per import (decision
+// 6). See design-notes/n-tier-generalization.md in heain-core.
 //
-// External data enters only via bulk import, snapshot-style -- there is no
-// continuous/incremental sync from the external source. Each import is one
-// versioned snapshot, scoped to the operator-chosen ScopeKey it was
-// imported for; verification lookups always query the currently-active
-// snapshot for that scope.
+// v2 (Step 4b-2, 2026-10-06): every (dataset, scope_key) has its own data
+// key in heain-core's KMS. Values are sealed and record keys (e.g. citizen
+// ids) are stored only blinded (HMAC), so the SQL database holds no
+// plaintext reference data. Purge deletes the rows and destroys the key in
+// core: copies in database backups are unreadable too (crypto-shred).
 package externalstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/heainframework/heain-database/internal/box"
 )
 
 // ErrNotFound is returned when a lookup finds no matching dataset/record.
 var ErrNotFound = errors.New("externalstore: not found")
 
-// LifecycleAction is the configured end-of-life behavior for a dataset,
-// set per import -- never a module-wide constant. See decision 6 in
-// design-notes/n-tier-generalization.md: "outside" datasets' end-of-life
-// action is operator-configurable per import, not a single mandated
-// behavior.
+// LifecycleAction is a dataset's configured end-of-life behavior, set per
+// import (decision 6).
 type LifecycleAction string
 
 const (
-	// LifecycleFullPurge is the recommended default for sensitive,
-	// job/event-scoped reference data (e.g. the voter-eligibility case):
-	// a full, unconditional, irreversible delete via Purge, invoked
-	// explicitly once the job/event ends. It is never automatic.
+	// LifecycleFullPurge: full, irreversible deletion (rows and key) once
+	// the job/event ends, requested explicitly and approved through P5.
 	LifecycleFullPurge LifecycleAction = "full_purge"
-	// LifecycleRetain leaves the dataset in place after the job/event
-	// completes, to be queried again later or explicitly re-imported.
+	// LifecycleRetain keeps the dataset after the job/event (the default).
 	LifecycleRetain LifecycleAction = "retain"
-	// LifecycleArchive is carried as a distinct, named policy value for
-	// Stage A's schema even though its own concrete behavior (e.g. moving
-	// to colder storage vs. merely flagging as closed-but-kept) is not
-	// decided yet -- deferred until a real need for it arises.
+	// LifecycleArchive is a named value whose behavior is not decided yet.
 	LifecycleArchive LifecycleAction = "archive"
 )
 
@@ -62,14 +55,9 @@ type LifecyclePolicy struct {
 	OnComplete LifecycleAction `json:"on_complete"`
 }
 
-// Dataset is one imported external-data snapshot, scoped to ScopeKey.
-//
-// ScopeKey is a free-form, operator-chosen partition identifier -- a zone
-// id, a province/district code, a customer id, a time window, or any other
-// granularity that fits the deployment -- never a protocol-fixed "zone"
-// enum. An import pulls in only the records matching its own ScopeKey, so
-// a lookup stays fast against a small, relevant table rather than a large
-// blob pulled in whole and filtered afterward.
+// Dataset is one imported external-data snapshot, scoped to ScopeKey (a
+// free-form, operator-chosen partition: a zone, a district code, a
+// customer id, a time window).
 type Dataset struct {
 	Name              string          `json:"name"`
 	Version           int             `json:"version"`
@@ -77,31 +65,16 @@ type Dataset struct {
 	ImportedAt        time.Time       `json:"imported_at"`
 	SourceDescription string          `json:"source_description"`
 	LifecyclePolicy   LifecyclePolicy `json:"lifecycle_policy"`
+	RecordCount       int             `json:"record_count"`
 }
 
-// Record is one imported reference record, identified by its RecordKey
-// within a dataset+scope (e.g. a citizen id within a voter-eligibility
-// dataset for one electoral area). Value is an opaque JSON document --
-// externalstore never interprets its shape; that is the calling module's
-// (and the source dataset's) business.
+// Record is one imported reference record; Value is opaque JSON.
 type Record struct {
 	RecordKey string          `json:"record_key"`
 	Value     json.RawMessage `json:"value"`
 }
 
-// Store is a database/sql-backed external-reference store. It speaks only
-// ANSI-portable SQL (ON CONFLICT upserts, no engine-specific types), so it
-// runs unchanged against PostgreSQL or SQLite -- the engine and its driver
-// are wired by the caller (cmd/node), never imported here.
-type Store struct {
-	db      *sql.DB
-	dialect Dialect
-}
-
-// Dialect names the one portability difference externalstore must account
-// for itself: parameter placeholder syntax ("?" vs "$1, $2, ...").
-// Everything else (upsert via ON CONFLICT, column types) is written to
-// work identically on both.
+// Dialect is the one portability difference: placeholder syntax.
 type Dialect string
 
 const (
@@ -109,58 +82,65 @@ const (
 	DialectSQLite   Dialect = "sqlite"
 )
 
-// Open wires a Store on top of an already-opened *sql.DB (opened by the
-// caller with whichever driver the deployment chose) and ensures the
-// schema exists.
-func Open(ctx context.Context, db *sql.DB, dialect Dialect) (*Store, error) {
-	s := &Store{db: db, dialect: dialect}
-	if err := s.migrate(ctx); err != nil {
-		return nil, fmt.Errorf("externalstore: migrate: %w", err)
+// Keys gives the Box of one (dataset, scope) data key, by its key name;
+// Destroy crypto-shreds that key in heain-core.
+type Keys struct {
+	Box     func(ctx context.Context, keyName string) (*box.Box, error)
+	Destroy func(ctx context.Context, keyName string) error
+}
+
+// KeyName is the data key name of (name, scopeKey) in heain-core's KMS.
+func KeyName(name, scopeKey string) string {
+	h := sha256.Sum256([]byte(name + "\x00" + scopeKey))
+	return "ds-" + hex.EncodeToString(h[:20])
+}
+
+// Store is a database/sql-backed external-reference store.
+type Store struct {
+	db      *sql.DB
+	dialect Dialect
+	keys    Keys
+}
+
+// Open wires a Store on an opened *sql.DB and ensures the schema.
+func Open(ctx context.Context, db *sql.DB, dialect Dialect, keys Keys) (*Store, error) {
+	s := &Store{db: db, dialect: dialect, keys: keys}
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS hdb_datasets (
+			name TEXT NOT NULL,
+			scope_key TEXT NOT NULL,
+			version INTEGER NOT NULL,
+			imported_at TEXT NOT NULL,
+			source_description TEXT NOT NULL,
+			lifecycle_on_complete TEXT NOT NULL,
+			record_count INTEGER NOT NULL,
+			PRIMARY KEY (name, scope_key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS hdb_records (
+			dataset_name TEXT NOT NULL,
+			scope_key TEXT NOT NULL,
+			record_ix TEXT NOT NULL,
+			value TEXT NOT NULL,
+			PRIMARY KEY (dataset_name, scope_key, record_ix)
+		)`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return nil, fmt.Errorf("externalstore: migrate: %w", err)
+		}
 	}
 	return s, nil
 }
 
-func (s *Store) migrate(ctx context.Context) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS datasets (
-			name TEXT NOT NULL,
-			scope_key TEXT NOT NULL,
-			version INTEGER NOT NULL,
-			imported_at TIMESTAMP NOT NULL,
-			source_description TEXT NOT NULL,
-			lifecycle_on_complete TEXT NOT NULL,
-			PRIMARY KEY (name, scope_key)
-		)`,
-		`CREATE TABLE IF NOT EXISTS external_records (
-			dataset_name TEXT NOT NULL,
-			scope_key TEXT NOT NULL,
-			record_key TEXT NOT NULL,
-			value TEXT NOT NULL,
-			PRIMARY KEY (dataset_name, scope_key, record_key)
-		)`,
-	}
-	for _, stmt := range stmts {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("exec %q: %w", stmt, err)
-		}
-	}
-	return nil
-}
-
-// rebind rewrites a "?"-placeholder query into the active dialect's own
-// placeholder syntax. Writing every query with "?" internally, then
-// rebinding once here, is what keeps the rest of this file dialect-free.
-func (s *Store) rebind(query string) string {
+func (s *Store) rebind(q string) string {
 	if s.dialect != DialectPostgres {
-		return query
+		return q
 	}
 	var b strings.Builder
 	n := 0
-	for _, r := range query {
+	for _, r := range q {
 		if r == '?' {
 			n++
-			b.WriteByte('$')
-			b.WriteString(strconv.Itoa(n))
+			b.WriteString("$" + strconv.Itoa(n))
 			continue
 		}
 		b.WriteRune(r)
@@ -168,143 +148,135 @@ func (s *Store) rebind(query string) string {
 	return b.String()
 }
 
-func (s *Store) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return s.db.ExecContext(ctx, s.rebind(query), args...)
-}
+func aad(name, scope, ix string) string { return "record/" + name + "\x00" + scope + "\x00" + ix }
 
-func (s *Store) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return s.db.QueryContext(ctx, s.rebind(query), args...)
-}
-
-func (s *Store) queryRow(ctx context.Context, query string, args ...any) *sql.Row {
-	return s.db.QueryRowContext(ctx, s.rebind(query), args...)
-}
-
-// Import replaces the currently-active snapshot for (name, scopeKey) with
-// a new versioned one, in a single transaction: the dataset's own prior
-// records for that scope are deleted, the new metadata row is upserted,
-// and every record in the import is inserted. This is the only update
-// path for Stage A -- there is no incremental/partial update, deliberately,
-// so every import is one clear, auditable event.
+// Import replaces the active snapshot for (name, scopeKey) with a new
+// version, in one transaction (the only update path, deliberately).
 func (s *Store) Import(ctx context.Context, name, scopeKey, sourceDescription string, policy LifecyclePolicy, records []Record) (Dataset, error) {
 	if name == "" || scopeKey == "" {
 		return Dataset{}, errors.New("externalstore: name and scope key must not be empty")
 	}
-	if policy.OnComplete == "" {
+	switch policy.OnComplete {
+	case "":
 		policy.OnComplete = LifecycleRetain
+	case LifecycleRetain, LifecycleFullPurge, LifecycleArchive:
+	default:
+		return Dataset{}, fmt.Errorf("externalstore: lifecycle on_complete must be retain, full_purge or archive")
 	}
-
+	b, err := s.keys.Box(ctx, KeyName(name, scopeKey))
+	if err != nil {
+		return Dataset{}, fmt.Errorf("externalstore: data key: %w", err)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Dataset{}, err
 	}
-	defer tx.Rollback() //nolint:errcheck // no-op if committed
-
-	var prevVersion int
-	row := tx.QueryRowContext(ctx, s.rebind(`SELECT version FROM datasets WHERE name = ? AND scope_key = ?`), name, scopeKey)
-	switch err := row.Scan(&prevVersion); {
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+	prev := 0
+	switch err := tx.QueryRowContext(ctx, s.rebind(`SELECT version FROM hdb_datasets WHERE name = ? AND scope_key = ?`), name, scopeKey).Scan(&prev); {
 	case errors.Is(err, sql.ErrNoRows):
-		prevVersion = 0
 	case err != nil:
 		return Dataset{}, err
 	}
-	ds := Dataset{
-		Name:              name,
-		Version:           prevVersion + 1,
-		ScopeKey:          scopeKey,
-		ImportedAt:        time.Now().UTC(),
-		SourceDescription: sourceDescription,
-		LifecyclePolicy:   policy,
-	}
-
-	if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM external_records WHERE dataset_name = ? AND scope_key = ?`), name, scopeKey); err != nil {
+	ds := Dataset{Name: name, Version: prev + 1, ScopeKey: scopeKey, ImportedAt: time.Now().UTC(), SourceDescription: sourceDescription,
+		LifecyclePolicy: policy, RecordCount: len(records)}
+	if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM hdb_records WHERE dataset_name = ? AND scope_key = ?`), name, scopeKey); err != nil {
 		return Dataset{}, err
 	}
-
-	upsertDataset := s.rebind(`
-		INSERT INTO datasets (name, scope_key, version, imported_at, source_description, lifecycle_on_complete)
-		VALUES (?, ?, ?, ?, ?, ?)
+	if _, err := tx.ExecContext(ctx, s.rebind(`
+		INSERT INTO hdb_datasets (name, scope_key, version, imported_at, source_description, lifecycle_on_complete, record_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (name, scope_key) DO UPDATE SET
-			version = excluded.version,
-			imported_at = excluded.imported_at,
-			source_description = excluded.source_description,
-			lifecycle_on_complete = excluded.lifecycle_on_complete`)
-	if _, err := tx.ExecContext(ctx, upsertDataset, ds.Name, ds.ScopeKey, ds.Version, ds.ImportedAt, ds.SourceDescription, string(ds.LifecyclePolicy.OnComplete)); err != nil {
+			version = excluded.version, imported_at = excluded.imported_at, source_description = excluded.source_description,
+			lifecycle_on_complete = excluded.lifecycle_on_complete, record_count = excluded.record_count`),
+		name, scopeKey, ds.Version, ds.ImportedAt.Format(time.RFC3339Nano), sourceDescription, string(policy.OnComplete), ds.RecordCount); err != nil {
 		return Dataset{}, err
 	}
-
-	insertRecord := s.rebind(`INSERT INTO external_records (dataset_name, scope_key, record_key, value) VALUES (?, ?, ?, ?)`)
+	ins := s.rebind(`INSERT INTO hdb_records (dataset_name, scope_key, record_ix, value) VALUES (?, ?, ?, ?)`)
+	seen := map[string]bool{}
 	for _, rec := range records {
 		if rec.RecordKey == "" {
-			return Dataset{}, fmt.Errorf("externalstore: record key must not be empty")
+			return Dataset{}, errors.New("externalstore: record key must not be empty")
 		}
-		if _, err := tx.ExecContext(ctx, insertRecord, name, scopeKey, rec.RecordKey, string(rec.Value)); err != nil {
+		if seen[rec.RecordKey] {
+			return Dataset{}, errors.New("externalstore: duplicate record key in one import")
+		}
+		seen[rec.RecordKey] = true
+		ix := b.Index("record", rec.RecordKey)
+		plain, _ := json.Marshal(rec)
+		if _, err := tx.ExecContext(ctx, ins, name, scopeKey, ix, base64.StdEncoding.EncodeToString(b.Seal(plain, aad(name, scopeKey, ix)))); err != nil {
 			return Dataset{}, err
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return Dataset{}, err
-	}
-	return ds, nil
+	return ds, tx.Commit()
 }
 
-// GetDataset returns the currently-active dataset metadata for
-// (name, scopeKey), or ErrNotFound.
+// GetDataset returns the active dataset metadata, or ErrNotFound.
 func (s *Store) GetDataset(ctx context.Context, name, scopeKey string) (Dataset, error) {
-	row := s.queryRow(ctx, `SELECT name, scope_key, version, imported_at, source_description, lifecycle_on_complete
-		FROM datasets WHERE name = ? AND scope_key = ?`, name, scopeKey)
 	var ds Dataset
-	var onComplete string
-	err := row.Scan(&ds.Name, &ds.ScopeKey, &ds.Version, &ds.ImportedAt, &ds.SourceDescription, &onComplete)
+	var at, oc string
+	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT name, scope_key, version, imported_at, source_description, lifecycle_on_complete, record_count
+		FROM hdb_datasets WHERE name = ? AND scope_key = ?`), name, scopeKey).Scan(&ds.Name, &ds.ScopeKey, &ds.Version, &at, &ds.SourceDescription, &oc, &ds.RecordCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Dataset{}, ErrNotFound
 	}
 	if err != nil {
 		return Dataset{}, err
 	}
-	ds.LifecyclePolicy = LifecyclePolicy{OnComplete: LifecycleAction(onComplete)}
+	ds.ImportedAt, _ = time.Parse(time.RFC3339Nano, at)
+	ds.LifecyclePolicy = LifecyclePolicy{OnComplete: LifecycleAction(oc)}
 	return ds, nil
 }
 
-// GetRecord looks up one record within (name, scopeKey)'s currently-active
-// snapshot. The lookup is always scoped -- there is no cross-scope query
-// in Stage A, by design (deferred, not forgotten; see the design note).
+// GetRecord looks up one record in (name, scopeKey)'s active snapshot.
+// There is no cross-scope query, by design.
 func (s *Store) GetRecord(ctx context.Context, name, scopeKey, recordKey string) (Record, error) {
-	row := s.queryRow(ctx, `SELECT record_key, value FROM external_records
-		WHERE dataset_name = ? AND scope_key = ? AND record_key = ?`, name, scopeKey, recordKey)
-	var rec Record
-	var value string
-	err := row.Scan(&rec.RecordKey, &value)
+	if _, err := s.GetDataset(ctx, name, scopeKey); err != nil {
+		return Record{}, err // never create a key for a dataset that does not exist
+	}
+	b, err := s.keys.Box(ctx, KeyName(name, scopeKey))
+	if err != nil {
+		return Record{}, err
+	}
+	ix := b.Index("record", recordKey)
+	var v string
+	err = s.db.QueryRowContext(ctx, s.rebind(`SELECT value FROM hdb_records WHERE dataset_name = ? AND scope_key = ? AND record_ix = ?`),
+		name, scopeKey, ix).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, ErrNotFound
 	}
 	if err != nil {
 		return Record{}, err
 	}
-	rec.Value = json.RawMessage(value)
-	return rec, nil
+	sealed, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		return Record{}, err
+	}
+	p, err := b.Open(sealed, aad(name, scopeKey, ix))
+	if err != nil {
+		return Record{}, err
+	}
+	var rec Record
+	return rec, json.Unmarshal(p, &rec)
 }
 
-// Purge performs the full, unconditional, irreversible deletion of a
-// dataset's scope: its metadata row and every one of its records. It is
-// available regardless of the dataset's configured LifecyclePolicy -- an
-// operator can always force-purge manually -- and it is the action Stage A
-// actually performs when a full_purge-policy dataset's trigger fires.
-// Purging a dataset/scope that does not exist is not an error: deletion is
-// idempotent.
+// Purge deletes a dataset scope -- its metadata and every record -- and
+// destroys its data key in heain-core, so any copy left in a backup cannot
+// be read. Idempotent. The api package calls it only after P5 approval.
 func (s *Store) Purge(ctx context.Context, name, scopeKey string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback() //nolint:errcheck // no-op if committed
-
-	if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM external_records WHERE dataset_name = ? AND scope_key = ?`), name, scopeKey); err != nil {
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+	if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM hdb_records WHERE dataset_name = ? AND scope_key = ?`), name, scopeKey); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM datasets WHERE name = ? AND scope_key = ?`), name, scopeKey); err != nil {
+	if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM hdb_datasets WHERE name = ? AND scope_key = ?`), name, scopeKey); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.keys.Destroy(ctx, KeyName(name, scopeKey))
 }

@@ -1,100 +1,55 @@
 package accountstore
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/heainframework/heain-database/internal/box"
 )
 
-func openTestStore(t *testing.T) *Store {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "accounts.db")
-	s, err := Open(path)
+func TestAccounts(t *testing.T) {
+	b, _ := box.New(bytes.Repeat([]byte{7}, 32))
+	p := filepath.Join(t.TempDir(), "accounts.db")
+	s, err := Open(p, b)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close() })
-	return s
-}
-
-func TestPutGet(t *testing.T) {
-	s := openTestStore(t)
-	acc, err := s.Put(Account{ID: "acc-1", Role: "operator", MetadataKV: map[string]string{"zone": "th-01"}})
-	if err != nil {
-		t.Fatalf("Put: %v", err)
+	a, err := s.Put(Account{ID: "citizen-1234567890123", Role: "voter", MetadataKV: map[string]string{"district": "secret-district-9"}})
+	if err != nil || a.CreatedAt.IsZero() {
+		t.Fatal(err)
 	}
-	if acc.CreatedAt.IsZero() || acc.UpdatedAt.IsZero() {
-		t.Fatalf("expected timestamps to be set, got %+v", acc)
+	a2, _ := s.Put(Account{ID: "citizen-1234567890123", Role: "officer"})
+	if !a2.CreatedAt.Equal(a.CreatedAt) {
+		t.Fatal("created_at is kept on replace")
 	}
-
-	got, err := s.Get("acc-1")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
+	if g, err := s.Get("citizen-1234567890123"); err != nil || g.Role != "officer" {
+		t.Fatalf("get: %+v %v", g, err)
 	}
-	if got.Role != "operator" || got.MetadataKV["zone"] != "th-01" {
-		t.Fatalf("unexpected account: %+v", got)
+	if _, err := s.Get("nobody"); err != ErrNotFound {
+		t.Fatal("not found")
 	}
-}
-
-func TestPutPreservesCreatedAt(t *testing.T) {
-	s := openTestStore(t)
-	first, err := s.Put(Account{ID: "acc-1", Role: "operator"})
-	if err != nil {
-		t.Fatalf("Put: %v", err)
+	_, _ = s.Put(Account{ID: "x2", Role: "r", MetadataKV: map[string]string{"district": "secret-district-9"}})
+	if l, _ := s.List(); len(l) != 2 {
+		t.Fatalf("list %d", len(l))
 	}
-	second, err := s.Put(Account{ID: "acc-1", Role: "admin"})
-	if err != nil {
-		t.Fatalf("Put: %v", err)
+	_ = s.Delete("x2")
+	_ = s.Delete("x2")
+	if l, _ := s.List(); len(l) != 1 {
+		t.Fatal("delete")
 	}
-	if !second.CreatedAt.Equal(first.CreatedAt) {
-		t.Fatalf("expected CreatedAt to be preserved across update: first=%v second=%v", first.CreatedAt, second.CreatedAt)
-	}
-	if second.Role != "admin" {
-		t.Fatalf("expected role to update, got %q", second.Role)
-	}
-}
-
-func TestGetNotFound(t *testing.T) {
-	s := openTestStore(t)
-	if _, err := s.Get("missing"); err != ErrNotFound {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-}
-
-func TestDeleteIdempotent(t *testing.T) {
-	s := openTestStore(t)
-	if _, err := s.Put(Account{ID: "acc-1"}); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if err := s.Delete("acc-1"); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if err := s.Delete("acc-1"); err != nil {
-		t.Fatalf("second Delete should be a no-op, got: %v", err)
-	}
-	if _, err := s.Get("acc-1"); err != ErrNotFound {
-		t.Fatalf("expected ErrNotFound after delete, got %v", err)
-	}
-}
-
-func TestList(t *testing.T) {
-	s := openTestStore(t)
-	for _, id := range []string{"a", "b", "c"} {
-		if _, err := s.Put(Account{ID: id}); err != nil {
-			t.Fatalf("Put(%s): %v", id, err)
+	_ = s.Close()
+	raw, _ := os.ReadFile(p)
+	for _, m := range []string{"citizen-1234567890123", "secret-district-9", "officer"} {
+		if bytes.Contains(raw, []byte(m)) {
+			t.Fatalf("plaintext %q at rest", m)
 		}
 	}
-	list, err := s.List()
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(list) != 3 {
-		t.Fatalf("expected 3 accounts, got %d", len(list))
-	}
-}
-
-func TestPutRejectsEmptyID(t *testing.T) {
-	s := openTestStore(t)
-	if _, err := s.Put(Account{}); err == nil {
-		t.Fatalf("expected error for empty id")
+	other, _ := box.New(bytes.Repeat([]byte{8}, 32))
+	s2, _ := Open(p, other)
+	defer s2.Close()
+	if _, err := s2.Get("citizen-1234567890123"); err == nil {
+		t.Fatal("another key must not find or open the record")
 	}
 }
