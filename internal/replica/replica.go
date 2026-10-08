@@ -5,8 +5,9 @@
 // Every instance seals inside data under the app's zone key (heain-sdk
 // App.ZoneKey), so a record and its blinded key are the same bytes on every
 // node and can be copied without being opened. Each write is recorded in a
-// local change log; every instance pulls the change logs of the other
-// instances of the zone (GET /v1/replica/changes) and applies what is newer:
+// local change log (this package, a zonesync.Log); every instance pulls the
+// change logs of the other instances of the zone (heain-sdk zonesync, GET
+// /v1/replica/changes) and applies what is newer:
 // last writer wins, by the write's time and then its origin. Applied changes
 // are logged again, so a node that joins later, or that was cut off, also
 // gets what came from a node that is gone. Nothing ever crosses a zone:
@@ -24,6 +25,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/heainframework/heain-sdk/zonesync"
 )
 
 // Target is one replicated store: it writes a sealed value as it is.
@@ -32,23 +35,12 @@ type Target interface {
 	ApplyRaw(key string, sealed []byte) error
 }
 
-// Change is one write.
-type Change struct {
-	Seq    uint64 `json:"seq"`
-	Store  string `json:"store"`
-	Key    string `json:"key"`             // blinded
-	Value  []byte `json:"value,omitempty"` // sealed; nil = deleted
-	TS     int64  `json:"ts"`              // unix nanoseconds of the write
-	Origin string `json:"origin"`          // the instance that wrote it
-}
+// Change is one write (heain-sdk zonesync carries it between instances).
+type Change = zonesync.Change
 
 type version struct {
 	TS     int64  `json:"ts"`
 	Origin string `json:"origin"`
-}
-
-func (c Change) newerThan(v version) bool {
-	return c.TS > v.TS || (c.TS == v.TS && c.Origin > v.Origin)
 }
 
 var (
@@ -216,7 +208,7 @@ func (l *Log) Apply(peer, epoch string, cs []Change) (int, error) {
 			if v := tx.Bucket(bVersions).Get([]byte(c.Store + "/" + c.Key)); v != nil {
 				var cur version
 				if json.Unmarshal(v, &cur) == nil {
-					newer = c.newerThan(cur)
+					newer = c.NewerThan(cur.TS, cur.Origin)
 				}
 			}
 			return nil
@@ -244,4 +236,41 @@ func (l *Log) Apply(peer, epoch string, cs []Change) (int, error) {
 		}
 	}
 	return applied, nil
+}
+
+// Compact drops changes a later change of the same record has replaced, so
+// the log grows with the records, not with every write. A peer that reads
+// past a dropped change still gets the record's latest change.
+func (l *Log) Compact() (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	err := l.db.Update(func(tx *bolt.Tx) error {
+		b, vs := tx.Bucket(bChanges), tx.Bucket(bVersions)
+		var dead [][]byte
+		err := b.ForEach(func(k, v []byte) error {
+			var c Change
+			if json.Unmarshal(v, &c) != nil {
+				return nil
+			}
+			var cur version
+			if raw := vs.Get([]byte(c.Store + "/" + c.Key)); raw != nil && json.Unmarshal(raw, &cur) == nil {
+				if cur.TS != c.TS || cur.Origin != c.Origin {
+					dead = append(dead, append([]byte(nil), k...))
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, k := range dead {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		n = len(dead)
+		return nil
+	})
+	return n, err
 }

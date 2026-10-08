@@ -80,6 +80,20 @@ func TestReplicaConverges(t *testing.T) {
 	if _, ok := xm["k1"]; ok {
 		t.Fatal("and the delete")
 	}
+	// compaction keeps only the latest change of each record
+	before, _, _ := func() (int, int, error) { _, h, cs, err := g.Changes(0, 1000); return len(cs), int(h), err }()
+	if n, err := g.Compact(); err != nil || n == 0 {
+		t.Fatalf("compact: %d %v", n, err)
+	}
+	_, _, cs, _ := g.Changes(0, 1000)
+	if len(cs) >= before {
+		t.Fatal("compaction must drop replaced changes")
+	}
+	y, ym := open(t, "y1")
+	pull(t, y, g, "g1")
+	if string(ym["k2"]) != "from-w" || ym["k1"] != nil {
+		t.Fatal("a node reading a compacted log still gets every record's latest state")
+	}
 	// an unknown store is refused
 	if _, err := x.Apply("g1", g.Epoch(), []Change{{Seq: 99, Store: "nope", Key: "k", TS: 1}}); err == nil {
 		t.Fatal("unknown store accepted")

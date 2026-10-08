@@ -118,7 +118,7 @@ clc -X DELETE $D2/v1/accounts/officer-7 >/dev/null
 until_ok '[ "$(clc $D1/v1/accounts/officer-7)" = 404 ]' && ok "a delete on W reaches G" || bad "delete"
 
 echo "== 4. G down: W keeps working, then G catches up"
-kill "$(cat "$P/G.pid")"; stopdb d1; sleep 2
+kill "$(cat "$P/G.pid")"; stopdb d1; sleep 12   # past W's 10 s certificate cache: W uses the last answer of G
 [ "$(clc -X PUT -d '{"role":"islander"}' $D2/v1/accounts/written-alone)" = 200 ] && [ "$(cl $D2/v1/accounts/citizen-early | j "d['role']")" = voter ] \
   && ok "G and d1 down: d2 still reads and writes (zone key copy on W)" || bad "W alone: $(tail -3 "$W/d2.log")"
 startG; sleep 6; run_db d1 $URL G 19460

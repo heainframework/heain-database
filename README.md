@@ -61,3 +61,5 @@ The author decided (2026-10-08): inside data syncs inside a zone, ciphertext onl
 - **Known limits:** a write and its log entry are two files: a crash between them leaves that write unsent until the record is written again. Two nodes cut off from each other that both write one record keep the later write when they meet; the other is lost (last writer wins).
 
 Tests: `scripts/live_b1b.sh` (Master + farm Worker, one instance on each).
+
+2.1.1 (Stage B-1c, 2026-10-08): the network side of zone sync moved to heain-sdk `zonesync` (shared with heain-gateway); this app keeps its change log, and drops every hour the changes a later change of the same record replaced, so the log grows with the records rather than with every write.
