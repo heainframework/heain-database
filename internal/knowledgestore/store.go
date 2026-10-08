@@ -52,6 +52,70 @@ type Entry struct {
 type Store struct {
 	db  *bolt.DB
 	box *box.Box
+	// OnWrite, when set, is told every local write (blinded key, sealed
+	// value). The zone replica logs it (Stage B).
+	OnWrite func(key string, sealed []byte) error
+}
+
+// ApplyRaw stores a sealed entry as it is (nil = delete): a write that
+// came from another node of the zone.
+func (s *Store) ApplyRaw(k string, sealed []byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if sealed == nil {
+			return tx.Bucket(bucketEntries).Delete([]byte(k))
+		}
+		return tx.Bucket(bucketEntries).Put([]byte(k), sealed)
+	})
+}
+
+// Rekey seals every entry again under this store's box, reading it with
+// from (see accountstore.Rekey).
+func (s *Store) Rekey(from *box.Box) (moved, skipped int, err error) {
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketEntries)
+		type kv struct{ k, v []byte }
+		var all []kv
+		_ = b.ForEach(func(k, v []byte) error {
+			all = append(all, kv{append([]byte(nil), k...), append([]byte(nil), v...)})
+			return nil
+		})
+		for _, e := range all {
+			if _, err := s.box.Open(e.v, "knowledge/"+string(e.k)); err == nil {
+				continue
+			}
+			p, err := from.Open(e.v, "knowledge/"+string(e.k))
+			if err != nil {
+				skipped++
+				continue
+			}
+			var en Entry
+			if err := json.Unmarshal(p, &en); err != nil {
+				return err
+			}
+			nk := s.box.Index("knowledge", en.Namespace, en.Key)
+			if err := b.Delete(e.k); err != nil {
+				return err
+			}
+			if err := b.Put([]byte(nk), s.box.Seal(p, "knowledge/"+nk)); err != nil {
+				return err
+			}
+			moved++
+		}
+		return nil
+	})
+	return
+}
+
+// All returns every blinded key and its sealed entry.
+func (s *Store) All() (map[string][]byte, error) {
+	out := map[string][]byte{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketEntries).ForEach(func(k, v []byte) error {
+			out[string(k)] = append([]byte(nil), v...)
+			return nil
+		})
+	})
+	return out, err
 }
 
 // Open opens (creating if necessary) the BoltDB file at path.
@@ -117,6 +181,7 @@ func (s *Store) put(namespace, key, value string, kind Kind, actionID string) (E
 	}
 	k := s.box.Index("knowledge", namespace, key)
 	var e Entry
+	var sealed []byte
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketEntries)
 		version := uint64(1)
@@ -131,7 +196,11 @@ func (s *Store) put(namespace, key, value string, kind Kind, actionID string) (E
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(k), s.box.Seal(data, "knowledge/"+k))
+		sealed = s.box.Seal(data, "knowledge/"+k)
+		return b.Put([]byte(k), sealed)
 	})
-	return e, err
+	if err != nil || s.OnWrite == nil {
+		return e, err
+	}
+	return e, s.OnWrite(k, sealed)
 }

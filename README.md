@@ -49,3 +49,15 @@ Any way you like — a plain process, a service unit, a container. It is configu
 Tests: `go test ./...`; live `bash scripts/live_4b.sh` (needs `~/heain-core`, `~/heain-sdk` and PostgreSQL server binaries; it starts and removes a throwaway cluster on port 15432); conformance `heain-conformance run --app .` (SQLite).
 
 Design history: heain-core `design-notes/n-tier-generalization.md` ("heain-database: inside/outside split", decisions 1–6) and `docs/progress-log.md` (Step 4b).
+
+## Stage B-1b: inside data on every node of the zone (2.1, 2026-10-08)
+
+The author decided (2026-10-08): inside data syncs inside a zone, ciphertext only. This replaces "inside-data sync between nodes stays Stage B" above.
+
+- **Zone key.** Accounts and knowledge are sealed under the zone key `inside` (heain-sdk `App.ZoneKey`; core keeps it on every node of the zone). Their data classes are now `zone-local`. Outside datasets stay `node-local` and are never synced; pending P5 requests stay on the node that proposed them.
+- **Change logs.** Every write is recorded in `<state>/replica.db`. Each instance reads the logs of the other instances of the zone (`GET /v1/replica/changes`, capability `db.replica`, found with zone discovery, called over mTLS) every `-zone-sync-every` (5 s) and applies what is newer: the later write wins, then the origin. Records are copied as they are, sealed, never opened. Applied changes are logged again, so a node that joins later, or was cut off, also gets what came from a node that is gone. Only another heain-database instance may read a change log (403 otherwise). Applied batches are audited in core (`db.replica`, counts only).
+- **Cut off.** A node cut off from its Master keeps reading and writing (its copy of the zone key); its writes reach the others when it is back.
+- **Upgrade.** On the first start with zone sync, records sealed under the node key are sealed again under the zone key, and a new change log starts with everything already held. `-zone-sync=false` (`HEAIN_DB_ZONE_SYNC=off`) keeps the old behaviour: everything on this node, under the node key.
+- **Known limits:** a write and its log entry are two files: a crash between them leaves that write unsent until the record is written again. Two nodes cut off from each other that both write one record keep the later write when they meet; the other is lost (last writer wins).
+
+Tests: `scripts/live_b1b.sh` (Master + farm Worker, one instance on each).

@@ -3,8 +3,9 @@
 // never credential material -- heain-access remains the system of record
 // for verification.
 //
-// Storage: embedded BoltDB on this node (data class "account",
-// sovereignty node-local). Every record is sealed under the app's data key
+// Storage: embedded BoltDB (data class "account", sovereignty zone-local
+// since Stage B: with zone sync the same sealed records are kept on every
+// node of the zone, see internal/replica). Every record is sealed under the app's data key
 // from heain-core's KMS and filed under a blinded id (internal/box), so the
 // file holds no plaintext id, role or metadata.
 package accountstore
@@ -40,6 +41,79 @@ type Account struct {
 type Store struct {
 	db  *bolt.DB
 	box *box.Box
+	// OnWrite, when set, is told every local write: the blinded key and the
+	// sealed value (nil = deleted). The zone replica logs it (Stage B).
+	OnWrite func(key string, sealed []byte) error
+}
+
+func (s *Store) wrote(k string, sealed []byte) error {
+	if s.OnWrite == nil {
+		return nil
+	}
+	return s.OnWrite(k, sealed)
+}
+
+// ApplyRaw stores a sealed value as it is under a blinded key (nil =
+// delete): a write that came from another node of the zone.
+func (s *Store) ApplyRaw(k string, sealed []byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if sealed == nil {
+			return tx.Bucket(bucketAccounts).Delete([]byte(k))
+		}
+		return tx.Bucket(bucketAccounts).Put([]byte(k), sealed)
+	})
+}
+
+// Rekey seals every account again under this store's box, reading it with
+// from (a node data key, before zone sync). It returns how many moved;
+// an account that from cannot open is left as it is and counted in skipped.
+func (s *Store) Rekey(from *box.Box) (moved, skipped int, err error) {
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAccounts)
+		type kv struct{ k, v []byte }
+		var all []kv
+		_ = b.ForEach(func(k, v []byte) error {
+			all = append(all, kv{append([]byte(nil), k...), append([]byte(nil), v...)})
+			return nil
+		})
+		for _, e := range all {
+			if _, err := s.box.Open(e.v, "account/"+string(e.k)); err == nil {
+				continue // already under this box
+			}
+			p, err := from.Open(e.v, "account/"+string(e.k))
+			if err != nil {
+				skipped++
+				continue
+			}
+			var acc Account
+			if err := json.Unmarshal(p, &acc); err != nil {
+				return err
+			}
+			nk := s.ix(acc.ID)
+			if err := b.Delete(e.k); err != nil {
+				return err
+			}
+			if err := b.Put([]byte(nk), s.box.Seal(p, "account/"+nk)); err != nil {
+				return err
+			}
+			moved++
+		}
+		return nil
+	})
+	return
+}
+
+// All returns every blinded key and its sealed value (to log them once
+// when zone sync starts).
+func (s *Store) All() (map[string][]byte, error) {
+	out := map[string][]byte{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketAccounts).ForEach(func(k, v []byte) error {
+			out[string(k)] = append([]byte(nil), v...)
+			return nil
+		})
+	})
+	return out, err
 }
 
 // Open opens (creating if necessary) the BoltDB file at path.
@@ -83,7 +157,8 @@ func (s *Store) Put(acc Account) (Account, error) {
 	}
 	now := time.Now().UTC()
 	k := s.ix(acc.ID)
-	return acc, s.db.Update(func(tx *bolt.Tx) error {
+	var sealed []byte
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketAccounts)
 		if prev, err := s.read(b, k); err == nil {
 			acc.CreatedAt = prev.CreatedAt
@@ -95,8 +170,13 @@ func (s *Store) Put(acc Account) (Account, error) {
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(k), s.box.Seal(data, "account/"+k))
+		sealed = s.box.Seal(data, "account/"+k)
+		return b.Put([]byte(k), sealed)
 	})
+	if err != nil {
+		return acc, err
+	}
+	return acc, s.wrote(k, sealed)
 }
 
 // Get returns the account with the given id, or ErrNotFound.
@@ -112,9 +192,13 @@ func (s *Store) Get(id string) (Account, error) {
 
 // Delete removes the account with the given id (idempotent).
 func (s *Store) Delete(id string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketAccounts).Delete([]byte(s.ix(id)))
-	})
+	k := s.ix(id)
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketAccounts).Delete([]byte(k))
+	}); err != nil {
+		return err
+	}
+	return s.wrote(k, nil)
 }
 
 // List returns every account, ordered by blinded id (not by id).

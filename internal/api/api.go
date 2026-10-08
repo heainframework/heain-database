@@ -19,6 +19,7 @@ import (
 	"github.com/heainframework/heain-database/internal/accountstore"
 	"github.com/heainframework/heain-database/internal/externalstore"
 	"github.com/heainframework/heain-database/internal/knowledgestore"
+	"github.com/heainframework/heain-database/internal/replica"
 	"github.com/heainframework/heain-database/internal/requests"
 )
 
@@ -35,6 +36,8 @@ type API struct {
 	Knowledge *knowledgestore.Store
 	Requests  *requests.Store
 	External  *externalstore.Store
+	// Replica, when set, is the zone change log (Stage B zone sync).
+	Replica *replica.Log
 	// MaxImportBytes bounds one import request body.
 	MaxImportBytes int64
 	Logf           func(string, ...any)
@@ -74,6 +77,7 @@ func (a *API) Register(s *heain.Server) error {
 		"GET /v1/datasets/{name}":               a.getDataset,
 		"GET /v1/datasets/{name}/records/{key}": a.getRecord,
 		"POST /v1/datasets/{name}/purge":        a.proposePurge,
+		"GET /v1/replica/changes":               a.changes,
 	}
 	for p, f := range h {
 		if err := s.HandleFunc(p, f); err != nil {

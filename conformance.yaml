@@ -18,6 +18,8 @@ endpoints:
     expect: 200
     secret: conformance-secret-reference
   - {method: GET, path: "/v1/datasets/conf-voters?scope_key=d1", expect: 200}
+  # the zone change log answers another heain-database instance only (Stage B)
+  - {method: GET, path: /v1/replica/changes, expect: 403}
   - {method: GET, path: "/v1/datasets/conf-voters/records/rk-1?scope_key=d1", expect: 200}
 p5:
   propose: {method: PUT, path: /v1/policy/conf/threshold, body: {value: "0.9"}}
