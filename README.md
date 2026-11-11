@@ -41,7 +41,7 @@ Any way you like — a plain process, a service unit, a container. It is configu
 
 | Flag / variable | Default | |
 |---|---|---|
-| `-external-dialect` / `HEAIN_DB_DIALECT` | `postgres` | `postgres` or `sqlite` |
+| `-external-dialect` / `HEAIN_DB_DIALECT` | `postgres` | `postgres` or `sqlite` (SQLite through `modernc.org/sqlite`, pure Go, since 2026-11-12: no cgo, so it builds for Windows and macOS) |
 | `-external-dsn` / `HEAIN_DB_DSN` | — (sqlite: `<state>/external.db`) | e.g. `postgres://user@host:5432/db?sslmode=disable` |
 | `-max-import-mb` | 64 | largest import request |
 | `HEAIN_LISTEN` | `:19460` | where the endpoints are served |

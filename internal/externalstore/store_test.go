@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 
 	"github.com/heainframework/heain-database/internal/box"
 )
@@ -35,7 +35,7 @@ func (f *fakeKMS) keysAPI() Keys {
 func TestExternalStore(t *testing.T) {
 	ctx := context.Background()
 	p := filepath.Join(t.TempDir(), "ext.db")
-	db, err := sql.Open("sqlite3", p)
+	db, err := sql.Open("sqlite", p)
 	if err != nil {
 		t.Fatal(err)
 	}

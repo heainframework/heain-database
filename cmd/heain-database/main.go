@@ -21,7 +21,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // "pgx" database/sql driver
-	_ "github.com/mattn/go-sqlite3"    // "sqlite3" database/sql driver
+	_ "modernc.org/sqlite"             // "sqlite" database/sql driver, pure Go (no cgo: builds for Windows and macOS too)
 
 	"github.com/heainframework/heain-sdk/core"
 	"github.com/heainframework/heain-sdk/heain"
@@ -110,7 +110,7 @@ func main() {
 	switch *dialect {
 	case "postgres":
 	case "sqlite":
-		driver, d = "sqlite3", externalstore.DialectSQLite
+		driver, d = "sqlite", externalstore.DialectSQLite
 		if *dsn == "" {
 			*dsn = filepath.Join(state, "external.db")
 		}
